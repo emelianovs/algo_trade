@@ -27,5 +27,7 @@ which is brought by 'get_date' function, and gets price from 'get_reference_pric
 right in the script. Once everything is set, this function fires an order (side and number of contracts can also be changed
 in the script). After the order is placed, this function monitors it till it is filled, and then activates the next
 'stop-loss' function.
-This last function checks the futures price and if it goes too high (following the given algorithm), the function
+This next function checks the futures price and if it goes too high (following the given algorithm), the function
 places an opposite order to close this trade.
+The last function will be actually what runs the whole thing - it checks for the open contracts and if there are none,
+it will run the script to place the next order. And it will do nothing if there is an open order already.
