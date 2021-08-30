@@ -4,7 +4,7 @@ import math
 from typing import Tuple
 from ib_insync import *
 from tenacity import *
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from argparse import ArgumentParser
 from tabulate import tabulate
 
@@ -16,6 +16,8 @@ STRIKE_PRICE_WAIT_PERIOD = 10
 STRIKE_PRICE_MAX_WAIT_PERIOD = 100
 GENERIC_WAIT_TIME = 2
 CONTRACTS_NUMBER = 1
+TRIAL_ACCOUNT = True
+BANK_HOLIDAYS_DATES = ['2021-09-06', '2021-10-10', '2021-11-11', '2021-11-24', '2021-12-26']
 
 
 class ConnectionError(Exception):
@@ -41,51 +43,54 @@ def connect():
     if not ib.isConnected():
         raise ConnectionError('Cannot establish connection')
 
-    ib.reqMarketDataType(3)  # Needed only for trial account - delete or comment out when using with real acc
-    ib.client.setServerLogLevel(logLevel=1) # needs more detailed testing
+    if TRIAL_ACCOUNT:
+        ib.reqMarketDataType(3)
+
     return ib
 
 
 ib = connect()
 
 
-def get_latest_contract() -> Contract:
+def get_latest_contract() -> Contract or None:
     """
     Gets the information about the latest traded contract
     :return: Contract
     """
-    latest_contract = ib.trades()
-    if latest_contract:
-        return latest_contract[-1].contract
+    contracts = ib.trades()
+    if contracts:
+        return contracts[-1].contract
     else:
         log.debug('No latest contract.')
 
 
-@retry(wait=wait_fixed(2)) # critical issue here
-def get_available_date() -> str:
+@retry(wait=wait_fixed(3600))
+def get_available_date() -> date:
     """
     Find the next available date for trade
-    :return: str of specific data format
+    :return: date in datetime format
     """
     log.info('Looking for a suitable trade date...')
     latest_contract = get_latest_contract()
-    if not latest_contract is None:
+    latest_date_date = datetime.today().date()
+    if latest_contract:
         latest_date_string = latest_contract.lastTradeDateOrContractMonth
-        latest_date_date = datetime.strptime(latest_date_string, '%Y%m%d').date()
+        latest_date_from_contract = datetime.strptime(latest_date_string, '%Y%m%d').date()
+        if latest_date_from_contract > latest_date_date:
+            latest_date_date = latest_date_from_contract
         log.info(f'Latest contract date is {latest_date_date}')
-    else:
-        latest_date_date = datetime.today()
-        log.info(f'No latest contract found, starting with today date')
 
     for i in range(1, 7):
         candidate_date = latest_date_date + timedelta(days=i)
-        if candidate_date > datetime.today() + ORDER_PLACE_MAX_DATE:
+        if candidate_date > datetime.today().date() + ORDER_PLACE_MAX_DATE:
             raise NoSuitableDate('No suitable days left. Waiting till the next day.')
-        else:
-            if candidate_date.weekday() in TRADING_DAYS_OF_WEEK:
-                candidate_date_formatted = str(candidate_date).replace('-', '')
-                log.info(f'The closest possible date is {candidate_date}')
-                return candidate_date_formatted
+
+        if str(candidate_date) in BANK_HOLIDAYS_DATES:
+            return candidate_date + timedelta(days=1)
+
+        if candidate_date.weekday() in TRADING_DAYS_OF_WEEK:
+            log.info(f'The closest possible date is {candidate_date}')
+            return candidate_date
 
     assert False, 'Could not find available date'
 
@@ -105,15 +110,17 @@ def create_reference() -> Tuple[Contract, int]:
 
     for i in range(int(STRIKE_PRICE_MAX_WAIT_PERIOD / STRIKE_PRICE_WAIT_PERIOD)):
         reference_price_rounded = 5 * round(reference_price / 5)
-        if reference_price_rounded + 10 > reference_price:  # don't forget to remove + 10 in production
-            log.info(f'Good to go, reference futures price is {reference_price_rounded}')
+        if TRIAL_ACCOUNT:
+            reference_price_rounded = reference_price_rounded + 10
+        if reference_price_rounded > reference_price:
+            log.info(f'Good to go, reference futures price is {reference_price}, rounded is {reference_price_rounded}')
             return reference_futures_contract, reference_price_rounded
-        log.info('The current price does not allow to trade now, waiting.')
+        log.info(f'The current price {reference_price} does not allow to trade now, waiting.')
         ib.sleep(STRIKE_PRICE_WAIT_PERIOD)
     raise NoSuitablePrice('Can not find suitable price')
 
 
-def create_and_trade_contract(date: str, strike_price: float) -> Trade:
+def create_and_trade_contract(date: datetime, strike_price: int) -> Trade:
     """
 
     :param date: Date, available for trading, from get_available_date()
@@ -121,8 +128,10 @@ def create_and_trade_contract(date: str, strike_price: float) -> Trade:
     from create_reference() function
     :return: a Trade object
     """
-    option_contract = FuturesOption('ES', date, strike_price, 'C', 'GLOBEX')
+    date_formatted = str(date).replace('-', '')
+    option_contract = FuturesOption('ES', date_formatted, strike_price, 'C', 'GLOBEX')
     ib.qualifyContracts(option_contract)
+    test_qualify_contract = ib.qualifyContracts(option_contract)
 
     option_contract_order = MarketOrder('SELL', CONTRACTS_NUMBER)
     option_trade = ib.placeOrder(option_contract, option_contract_order)
@@ -161,7 +170,7 @@ def calculate_stop_loss_price(price: int) -> float:
     return stop_loss_price
 
 
-def set_stop_loss(date, reference_contract, strike_price):  # the last thing that needs to be tested
+def set_stop_loss(date, reference_contract, strike_price):
     """
     Sets an order on the opposite side to close the trade, once the reference futures price gets to a specific value
     :param date: date of the short contract from get_available_date()
@@ -169,6 +178,7 @@ def set_stop_loss(date, reference_contract, strike_price):  # the last thing tha
     :param strike_price: strike price of the actual Futures Option contract(same as reference futures contract price)
     :return:
     """
+    date_formatted = str(date).replace('-', '')
     stop_loss_price = calculate_stop_loss_price(strike_price)
     sl_price_condition = PriceCondition(
         price=stop_loss_price,
@@ -176,16 +186,12 @@ def set_stop_loss(date, reference_contract, strike_price):  # the last thing tha
         exch=reference_contract.exchange
     )
 
-    print(sl_price_condition)
-
-    sl_contract = FuturesOption('ES', date, strike_price, 'C', 'GLOBEX')
+    sl_contract = FuturesOption('ES', date_formatted, stop_loss_price, 'C', 'GLOBEX')
     ib.qualifyContracts(sl_contract)
 
     option_contract_order = MarketOrder('BUY', CONTRACTS_NUMBER)
     option_contract_order.conditions.append(sl_price_condition)
-    ib.placeOrder(sl_contract, option_contract_order)   # supposedly price condition doesn't work correctly -
-                                                        # it places order anyway
-                                                        # but needs to wait for a specific futures price
+    ib.placeOrder(sl_contract, option_contract_order)
 
 
 def main():
@@ -193,9 +199,8 @@ def main():
     Checks for open orders, and if there are none, runs the process of setting a trade
     :return:
     """
-    while True: # find a way to set limit
-        check_orders = ib.reqOpenOrders()
-        if check_orders:
+    while True:
+        if ib.reqOpenOrders():
             log.info('There is an open order currently, can not place more')
             ib.sleep(
                 int(OPEN_ORDERS_CHECK_PERIOD.total_seconds())
@@ -211,8 +216,8 @@ def show_report():
     """
     recent_trades = ib.trades()
     table = [
-        [i.contract.conId, i.contract.lastTradeDateOrContractMonth, i.contract.strike] for i in recent_trades
-        ]
+                [i.contract.conId, i.contract.lastTradeDateOrContractMonth, i.contract.strike] for i in recent_trades
+            ]
     headers = ['Contract ID', 'Date', 'Price']
     print(tabulate(table, headers=headers))
 
@@ -228,8 +233,11 @@ if __name__ == '__main__':
     formatter = logging.Formatter('%(message)s')
     console.setFormatter(formatter)
     logging.getLogger('').addHandler(console)
+    logging.getLogger('ib_insync').setLevel(logging.WARNING)
 
     log = logging.getLogger(__name__)
+
+    main()
 
     parser = ArgumentParser()
     parser.add_argument('command')
