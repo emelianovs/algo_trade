@@ -17,7 +17,9 @@ STRIKE_PRICE_MAX_WAIT_PERIOD = 100
 GENERIC_WAIT_TIME = 2
 CONTRACTS_NUMBER = 1
 TRIAL_ACCOUNT = True
-BANK_HOLIDAYS_DATES = ['2021-09-06', '2021-10-10', '2021-11-11', '2021-11-24', '2021-12-26']
+BANK_HOLIDAYS_DATES = [date(2021, 9, 6), date(2021, 10, 10), date(2021, 11, 11),
+                       date(2021, 11, 24), date(2021, 12, 26)]
+PERIOD_TO_WAIT_FOR_THE_NEXT_DAY = 3600
 
 
 class ConnectionError(Exception):
@@ -64,7 +66,7 @@ def get_latest_contract() -> Contract or None:
         log.debug('No latest contract.')
 
 
-@retry(wait=wait_fixed(3600))
+@retry(wait=wait_fixed(PERIOD_TO_WAIT_FOR_THE_NEXT_DAY))
 def get_available_date() -> date:
     """
     Find the next available date for trade
@@ -72,20 +74,24 @@ def get_available_date() -> date:
     """
     log.info('Looking for a suitable trade date...')
     latest_contract = get_latest_contract()
-    latest_date_date = datetime.today().date()
+    latest_date = datetime.today().date()
     if latest_contract:
         latest_date_string = latest_contract.lastTradeDateOrContractMonth
         latest_date_from_contract = datetime.strptime(latest_date_string, '%Y%m%d').date()
-        if latest_date_from_contract > latest_date_date:
-            latest_date_date = latest_date_from_contract
-        log.info(f'Latest contract date is {latest_date_date}')
+        if latest_date_from_contract > latest_date:
+            latest_date = latest_date_from_contract
+    log.info(f'Searching for suitable date, starting from {latest_date}')
 
     for i in range(1, 7):
-        candidate_date = latest_date_date + timedelta(days=i)
-        if candidate_date > datetime.today().date() + ORDER_PLACE_MAX_DATE:
-            raise NoSuitableDate('No suitable days left. Waiting till the next day.')
+        if latest_date == datetime.today().date():
+            candidate_date = latest_date
+        else:
+            candidate_date = latest_date + timedelta(days=i)
+            if candidate_date > datetime.today().date() + ORDER_PLACE_MAX_DATE:
+                raise NoSuitableDate('No suitable days left. Waiting till the next day.')
 
         if str(candidate_date) in BANK_HOLIDAYS_DATES:
+            log.info(f'{candidate_date} is a bank holiday, moving to the next day. ')
             return candidate_date + timedelta(days=1)
 
         if candidate_date.weekday() in TRADING_DAYS_OF_WEEK:
@@ -109,9 +115,10 @@ def create_reference() -> Tuple[Contract, int]:
         reference_price = reference_futures_ticker.close
 
     for i in range(int(STRIKE_PRICE_MAX_WAIT_PERIOD / STRIKE_PRICE_WAIT_PERIOD)):
+        reference_price = reference_futures_ticker.close
         reference_price_rounded = 5 * round(reference_price / 5)
         if TRIAL_ACCOUNT:
-            reference_price_rounded = reference_price_rounded + 10
+            reference_price_rounded += 10
         if reference_price_rounded > reference_price:
             log.info(f'Good to go, reference futures price is {reference_price}, rounded is {reference_price_rounded}')
             return reference_futures_contract, reference_price_rounded
@@ -120,7 +127,7 @@ def create_reference() -> Tuple[Contract, int]:
     raise NoSuitablePrice('Can not find suitable price')
 
 
-def create_and_trade_contract(date: datetime, strike_price: int) -> Trade:
+def create_and_trade_contract(date: date, strike_price: int) -> Trade:
     """
 
     :param date: Date, available for trading, from get_available_date()
@@ -128,10 +135,9 @@ def create_and_trade_contract(date: datetime, strike_price: int) -> Trade:
     from create_reference() function
     :return: a Trade object
     """
-    date_formatted = str(date).replace('-', '')
+    date_formatted = date.strftime('%Y%m%d')
     option_contract = FuturesOption('ES', date_formatted, strike_price, 'C', 'GLOBEX')
     ib.qualifyContracts(option_contract)
-    test_qualify_contract = ib.qualifyContracts(option_contract)
 
     option_contract_order = MarketOrder('SELL', CONTRACTS_NUMBER)
     option_trade = ib.placeOrder(option_contract, option_contract_order)
@@ -151,13 +157,11 @@ def set_option_trade():
     option_trade = create_and_trade_contract(date, strike_price)
     log.info(f'Order placed: {option_trade.order}')
 
-    while True:
-        status = option_trade.orderStatus.status
-        if status == 'Filled':
-            set_stop_loss(date, reference_contract, strike_price)
-            break
-
+    option_status = option_trade.orderStatus.status
+    while option_status != 'Filled':
         ib.sleep(GENERIC_WAIT_TIME)
+        option_status = option_trade.orderStatus.status
+    set_stop_loss(date, reference_contract, strike_price)
 
 
 def calculate_stop_loss_price(price: int) -> float:
@@ -178,7 +182,7 @@ def set_stop_loss(date, reference_contract, strike_price):
     :param strike_price: strike price of the actual Futures Option contract(same as reference futures contract price)
     :return:
     """
-    date_formatted = str(date).replace('-', '')
+    date_formatted = date.strftime('%Y%m%d')
     stop_loss_price = calculate_stop_loss_price(strike_price)
     sl_price_condition = PriceCondition(
         price=stop_loss_price,
