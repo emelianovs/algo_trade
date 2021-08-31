@@ -114,8 +114,7 @@ def create_reference() -> Tuple[Contract, int]:
         ib.sleep(GENERIC_WAIT_TIME.total_seconds())
         reference_price = reference_futures_ticker.close
 
-    for i in range(int(int(STRIKE_PRICE_MAX_WAIT_PERIOD.total_seconds()) /
-                       int(STRIKE_PRICE_WAIT_PERIOD.total_seconds()))):
+    for i in range(int(STRIKE_PRICE_MAX_WAIT_PERIOD / STRIKE_PRICE_WAIT_PERIOD)):
         reference_price = reference_futures_ticker.close
         reference_price_rounded = 5 * round(reference_price / 5)
         if TRIAL_ACCOUNT:
