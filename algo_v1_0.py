@@ -1,9 +1,9 @@
 import logging
 import math
 
-from typing import Tuple
-from ib_insync import *
-from tenacity import *
+from typing import Tuple, Optional
+from ib_insync import IB, Contract, ContFuture, MarketOrder, FuturesOption, Trade, PriceCondition
+from tenacity import retry, wait_fixed
 from datetime import datetime, timedelta, date
 from argparse import ArgumentParser
 from tabulate import tabulate
@@ -12,14 +12,14 @@ from tabulate import tabulate
 OPEN_ORDERS_CHECK_PERIOD = timedelta(minutes=1)
 ORDER_PLACE_MAX_DATE = timedelta(days=30)
 TRADING_DAYS_OF_WEEK = [0, 2, 4]
-STRIKE_PRICE_WAIT_PERIOD = 10
-STRIKE_PRICE_MAX_WAIT_PERIOD = 100
-GENERIC_WAIT_TIME = 2
+STRIKE_PRICE_WAIT_PERIOD = timedelta(seconds=10)
+STRIKE_PRICE_MAX_WAIT_PERIOD = timedelta(seconds=100)
+GENERIC_WAIT_TIME = timedelta(seconds=2)
 CONTRACTS_NUMBER = 1
 TRIAL_ACCOUNT = True
 BANK_HOLIDAYS_DATES = [date(2021, 9, 6), date(2021, 10, 10), date(2021, 11, 11),
                        date(2021, 11, 24), date(2021, 12, 26)]
-PERIOD_TO_WAIT_FOR_THE_NEXT_DAY = 3600
+PERIOD_TO_WAIT_FOR_THE_NEXT_DAY = timedelta(hours=1)
 
 
 class ConnectionError(Exception):
@@ -54,7 +54,7 @@ def connect():
 ib = connect()
 
 
-def get_latest_contract() -> Contract or None:
+def get_latest_contract() -> Optional[Contract]:
     """
     Gets the information about the latest traded contract
     :return: Contract
@@ -66,7 +66,7 @@ def get_latest_contract() -> Contract or None:
         log.debug('No latest contract.')
 
 
-@retry(wait=wait_fixed(PERIOD_TO_WAIT_FOR_THE_NEXT_DAY))
+@retry(wait=wait_fixed(int(PERIOD_TO_WAIT_FOR_THE_NEXT_DAY.total_seconds())))
 def get_available_date() -> date:
     """
     Find the next available date for trade
@@ -90,7 +90,7 @@ def get_available_date() -> date:
             if candidate_date > datetime.today().date() + ORDER_PLACE_MAX_DATE:
                 raise NoSuitableDate('No suitable days left. Waiting till the next day.')
 
-        if str(candidate_date) in BANK_HOLIDAYS_DATES:
+        if candidate_date in BANK_HOLIDAYS_DATES:
             log.info(f'{candidate_date} is a bank holiday, moving to the next day. ')
             return candidate_date + timedelta(days=1)
 
@@ -111,10 +111,11 @@ def create_reference() -> Tuple[Contract, int]:
     reference_futures_ticker = ib.reqMktData(reference_futures_contract)
     reference_price = reference_futures_ticker.close
     while math.isnan(reference_price):
-        ib.sleep(GENERIC_WAIT_TIME)
+        ib.sleep(GENERIC_WAIT_TIME.total_seconds())
         reference_price = reference_futures_ticker.close
 
-    for i in range(int(STRIKE_PRICE_MAX_WAIT_PERIOD / STRIKE_PRICE_WAIT_PERIOD)):
+    for i in range(int(int(STRIKE_PRICE_MAX_WAIT_PERIOD.total_seconds()) /
+                       int(STRIKE_PRICE_WAIT_PERIOD.total_seconds()))):
         reference_price = reference_futures_ticker.close
         reference_price_rounded = 5 * round(reference_price / 5)
         if TRIAL_ACCOUNT:
@@ -123,7 +124,7 @@ def create_reference() -> Tuple[Contract, int]:
             log.info(f'Good to go, reference futures price is {reference_price}, rounded is {reference_price_rounded}')
             return reference_futures_contract, reference_price_rounded
         log.info(f'The current price {reference_price} does not allow to trade now, waiting.')
-        ib.sleep(STRIKE_PRICE_WAIT_PERIOD)
+        ib.sleep(STRIKE_PRICE_WAIT_PERIOD.total_seconds())
     raise NoSuitablePrice('Can not find suitable price')
 
 
@@ -159,7 +160,7 @@ def set_option_trade():
 
     option_status = option_trade.orderStatus.status
     while option_status != 'Filled':
-        ib.sleep(GENERIC_WAIT_TIME)
+        ib.sleep(GENERIC_WAIT_TIME.total_seconds())
         option_status = option_trade.orderStatus.status
     set_stop_loss(date, reference_contract, strike_price)
 
